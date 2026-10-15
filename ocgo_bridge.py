@@ -12,8 +12,9 @@ import sys
 import subprocess
 import signal
 import time
+import uuid
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
 import httpx
@@ -29,22 +30,59 @@ OPENCODE_GO_OPENAI_CHAT_URL = "https://opencode.ai/inference/go/openai/v1/chat/c
 OPENCODE_GO_OPENAI_RESPONSES_URL = "https://opencode.ai/inference/go/openai/v1/responses"
 OPENCODE_GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models"
 
+SESSION_ID = str(uuid.uuid4())
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3456
 
+# <model-id>: (label, verified path)
 KNOWN_MODELS = {
-    "kimi-k2.6": "kimi-k2.6",
-    "kimi-k3": "kimi-k3",
-    "deepseek-v4-pro": "deepseek-v4-pro",
-    "grok-4.7": "grok-4.7",
-    "grok-4.6": "grok-4.6",
-    "claude-opus-5-5": "claude-opus-5-5",
-    "claude-sonnet-5-5": "claude-sonnet-5-5",
-    "claude-haiku-5-5": "claude-haiku-5-5",
-    "gpt-5-3-codex": "gpt-5-3-codex",
-    "gpt-5-2-codex": "gpt-5-2-codex",
-    "gpt-5-1-codex": "gpt-5-1-codex",
+    "longcat-2.0": "longcat-2.0",
+    "longcat-2.5-preview-free": "longcat-2.5-preview-free (free tier)",
+    "mimo-v2.6-flash": "mimo-v2.6-flash (cheapest)",
+    "glm-5.3-flash": "glm-5.3-flash (fastest)",
+    "kimi-k2.7-code": "kimi-k2.7-code",
+    "minimax-m2.5": "minimax-m2.5",
+    "kimi-k2.6": "kimi-k2.6 (expensive reasoning)",
+    "kimi-k3": "kimi-k3 (expensive reasoning)",
+    "grok-4.7": "grok-4.7 (Responses API / Codex)",
+    "deepseek-v4-pro": "deepseek-v4-pro (needs Global region)",
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash (needs Global region)",
 }
+
+
+def normalize_openai_messages(messages):
+    """Fold stray system messages into the lead system message and drop empties.
+
+    Claude Code injects mid-conversation system reminders, and most OpenAI-
+    compatible providers reject a system role anywhere but index 0.
+    """
+    system_parts = []
+    kept = []
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            content = msg.get("content")
+            if content:
+                if isinstance(content, list):
+                    system_parts.append(" ".join(
+                        str(p.get("text", "")) for p in content
+                        if isinstance(p, dict)))
+                else:
+                    system_parts.append(str(content))
+            continue
+
+        kept.append(msg)
+
+    if system_parts:
+        messages[:] = [{"role": "system", "content": "\n\n".join(system_parts)}] + kept
+    else:
+        messages[:] = kept
+
+    # A conversation cannot open on a tool result.
+    while messages and messages[0].get("role") == "tool":
+        messages.pop(0)
 
 
 def load_config():
@@ -180,18 +218,51 @@ def run_server(config):
     client = httpx.Client(timeout=httpx.Timeout(300.0))
 
     class ProxyHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def send_sse_headers(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+        def write_sse(self, event, payload):
+            body = f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+            self.wfile.write(f"{len(body):x}\r\n".encode())
+            self.wfile.write(body + b"\r\n")
+            self.wfile.flush()
+
+        def end_sse(self):
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def send_json(self, status, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_raw(self, status, body, content_type="application/json"):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(status)
+            if content_type:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, format, *args):
             pass
 
         def do_GET(self):
             if self.path == "/health":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"ok\n")
+                self.send_raw(200, b"ok\n", "text/plain")
             else:
-                self.send_response(404)
-                self.end_headers()
+                self.send_json(404, {"error": "not found"})
 
         def do_POST(self):
             content_length = int(self.headers.get("Content-Length", 0))
@@ -200,24 +271,23 @@ def run_server(config):
             try:
                 data = json.loads(body) if body else {}
             except json.JSONDecodeError:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'{"error": "invalid JSON"}')
+                self.send_json(400, {"error": "invalid JSON"})
                 return
 
             path = self.path
 
-            if path == "/v1/messages":
+            route = path.split("?", 1)[0]
+
+            if route == "/v1/messages":
                 handle_anthropic_messages(self, data, client, api_key)
-            elif path == "/v1/chat/completions":
+            elif route == "/v1/chat/completions":
                 handle_openai_chat(self, data, client, api_key)
-            elif path == "/v1/responses":
+            elif route == "/v1/responses":
                 handle_openai_responses(self, data, client, api_key)
-            elif path == "/v1/messages/count_tokens":
+            elif route == "/v1/messages/count_tokens":
                 handle_count_tokens(self, data)
             else:
-                self.send_response(404)
-                self.end_headers()
+                self.send_json(404, {"error": "not found"})
 
     def handle_anthropic_messages(handler, data, client, api_key):
         model = data.get("model", "")
@@ -269,13 +339,23 @@ def run_server(config):
                                 "tool_call_id": tool_call_id,
                                 "content": str(result_content),
                             })
-                content_str = " ".join(text_parts)
-                msg_dict = {"role": role, "content": content_str}
-                if tool_calls:
-                    msg_dict["tool_calls"] = tool_calls
-                openai_messages.append(msg_dict)
+                content_str = " ".join(text_parts).strip()
+                if tool_calls and not content_str:
+                    msg_dict = {"role": role, "content": None, "tool_calls": tool_calls}
+                    openai_messages.append(msg_dict)
+                elif tool_calls or content_str:
+                    msg_dict = {"role": role, "content": content_str}
+                    if tool_calls:
+                        msg_dict["tool_calls"] = tool_calls
+                    openai_messages.append(msg_dict)
+                # A message holding only tool_results already produced its own
+                # "tool" entries; emitting an empty user turn upsets providers.
             else:
-                openai_messages.append({"role": role, "content": str(content)})
+                text = str(content).strip()
+                if text:
+                    openai_messages.append({"role": role, "content": text})
+
+        normalize_openai_messages(openai_messages)
 
         openai_tools = []
         for tool in tools:
@@ -301,6 +381,7 @@ def run_server(config):
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "x-opencode-session": SESSION_ID,
         }
 
         try:
@@ -311,13 +392,11 @@ def run_server(config):
             )
 
             if resp.status_code >= 400:
-                handler.send_response(resp.status_code)
-                handler.end_headers()
-                handler.wfile.write(resp.content)
+                handler.send_raw(resp.status_code, resp.content)
                 return
 
             if stream:
-                handle_stream_chat_completion(handler, resp)
+                handle_stream_chat_completion(handler, resp, model)
             else:
                 handle_non_stream_chat_completion(handler, resp, model)
         except Exception as e:
@@ -325,31 +404,156 @@ def run_server(config):
             handler.end_headers()
             handler.wfile.write(json.dumps({"error": str(e)}).encode())
 
-    def handle_stream_chat_completion(handler, resp):
-        handler.send_response(200)
-        handler.send_header("Content-Type", "application/json")
-        handler.end_headers()
+    def handle_stream_chat_completion(handler, resp, model):
+        try:
+            handler.send_sse_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            resp.close()
+            return
 
-        buffer = b""
-        for chunk in resp.iter_bytes():
-            buffer += chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line_str = line.decode("utf-8", errors="replace").strip()
-                if not line_str or not line_str.startswith("data:"):
-                    continue
-                data_str = line_str[5:].strip()
-                if data_str == "[DONE]":
-                    handler.wfile.write(b'{"done": true}\n')
-                    handler.wfile.flush()
-                    continue
-                try:
-                    parsed = json.loads(data_str)
-                    handler.wfile.write(json.dumps(parsed).encode() + b"\n")
-                    handler.wfile.flush()
-                except json.JSONDecodeError:
-                    pass
-        resp.close()
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        def sse(event, payload):
+            handler.write_sse(event, payload)
+
+        started = False
+        stop_reason = "end_turn"
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        text_open = False
+        text_index = 0
+        tools = {}
+        next_index = 1
+
+        def close_text_block():
+            nonlocal text_open
+            if text_open:
+                sse("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                text_open = False
+
+        try:
+            buffer = b""
+            for chunk in resp.iter_bytes():
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        continue
+
+                    try:
+                        parsed = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if not started:
+                        started = True
+                        sse("message_start", {
+                            "type": "message_start",
+                            "message": {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": model,
+                                "stop_reason": None,
+                                "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                            },
+                        })
+
+                    u = parsed.get("usage") or {}
+                    if u.get("prompt_tokens") is not None:
+                        usage["input_tokens"] = u["prompt_tokens"]
+                    if u.get("completion_tokens") is not None:
+                        usage["output_tokens"] = u["completion_tokens"]
+
+                    choices = parsed.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+
+                    text = delta.get("content")
+                    if text:
+                        if not text_open:
+                            close_text_block()
+                            sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": text_index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                            text_open = True
+                        sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": text_index,
+                            "delta": {"type": "text_delta", "text": text},
+                        })
+
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        if idx not in tools:
+                            close_text_block()
+                            fn = tc.get("function") or {}
+                            tools[idx] = {
+                                "block": next_index,
+                                "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": fn.get("name") or "",
+                                "args": "",
+                            }
+                            next_index += 1
+                            sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": tools[idx]["block"],
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": tools[idx]["id"],
+                                    "name": tools[idx]["name"],
+                                    "input": {},
+                                },
+                            })
+                        frag = (tc.get("function") or {}).get("arguments")
+                        if frag:
+                            tools[idx]["args"] += frag
+                            sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": tools[idx]["block"],
+                                "delta": {"type": "input_json_delta", "partial_json": frag},
+                            })
+
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        if fr == "length":
+                            stop_reason = "max_tokens"
+                        elif fr == "tool_calls":
+                            stop_reason = "tool_use"
+                        else:
+                            stop_reason = "end_turn"
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            resp.close()
+
+        if started:
+            close_text_block()
+            for idx in sorted(tools):
+                sse("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": tools[idx]["block"],
+                })
+            sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": usage["output_tokens"]},
+            })
+            sse("message_stop", {"type": "message_stop"})
+
+        try:
+            handler.end_sse()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def handle_non_stream_chat_completion(handler, resp, model):
         try:
@@ -415,6 +619,7 @@ def run_server(config):
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "x-opencode-session": SESSION_ID,
         }
 
         try:
@@ -424,20 +629,50 @@ def run_server(config):
                 content=json.dumps(data),
             )
 
-            handler.send_response(resp.status_code)
-            handler.send_header("Content-Type", "application/json")
-            handler.end_headers()
-            handler.wfile.write(resp.content)
+            handler.send_raw(resp.status_code, resp.content)
         except Exception as e:
-            handler.send_response(502)
-            handler.end_headers()
-            handler.wfile.write(json.dumps({"error": str(e)}).encode())
+            handler.send_json(502, {"error": str(e)})
+
+    def sanitize_responses_body(payload):
+        data = dict(payload)
+
+        tools = data.get("tools")
+        if isinstance(tools, list):
+            cleaned = []
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("type") == "namespace":
+                    # OpenCode Go's Responses endpoint rejects namespace tool
+                    # containers; flatten their members to plain functions.
+                    inner = t.get("tools")
+                    if isinstance(inner, list):
+                        for it in inner:
+                            if isinstance(it, dict):
+                                cleaned.append(
+                                    {k: v for k, v in it.items()
+                                     if k != "external_web_access"}
+                                )
+                    continue
+                cleaned.append(
+                    {k: v for k, v in t.items() if k != "external_web_access"}
+                )
+            data["tools"] = cleaned
+
+        if not data.get("tools") and "tool_choice" in data:
+            data.pop("tool_choice", None)
+
+        if data.get("instructions") == "":
+            data.pop("instructions", None)
+
+        return data
 
     def handle_openai_responses(handler, data, client, api_key):
-        model = data.get("model", "")
+        data = sanitize_responses_body(data)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "x-opencode-session": SESSION_ID,
         }
 
         try:
@@ -447,14 +682,9 @@ def run_server(config):
                 content=json.dumps(data),
             )
 
-            handler.send_response(resp.status_code)
-            handler.send_header("Content-Type", "application/json")
-            handler.end_headers()
-            handler.wfile.write(resp.content)
+            handler.send_raw(resp.status_code, resp.content)
         except Exception as e:
-            handler.send_response(502)
-            handler.end_headers()
-            handler.wfile.write(json.dumps({"error": str(e)}).encode())
+            handler.send_json(502, {"error": str(e)})
 
     def handle_count_tokens(handler, data):
         handler.send_response(200)
@@ -462,7 +692,7 @@ def run_server(config):
         handler.end_headers()
         handler.wfile.write(json.dumps({"input_tokens": 0}).encode())
 
-    server = HTTPServer((host, port), ProxyHandler)
+    server = ThreadingHTTPServer((host, port), ProxyHandler)
     print(f"Proxy ready. Press Ctrl+C to stop.")
     try:
         server.serve_forever()
@@ -541,7 +771,25 @@ def launch_codex(model=None, extra_args=None):
 
     env = os.environ.copy()
     env["OPENAI_API_KEY"] = "ocgo-bridge"
-    env["OPENAI_BASE_URL"] = base_url
+    env["OPENAI_BASE_URL"] = f"{base_url}/v1"
+
+    # Codex validates model names client-side when it finds stored ChatGPT
+    # OAuth tokens. A private CODEX_HOME forces API-key auth mode and keeps
+    # the user's real ~/.codex untouched.
+    codex_home = CONFIG_DIR / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    profile = 'model_provider = "opencode-go"\n'
+    if model:
+        profile += f'model = "{model}"\n'
+    profile += f"""
+[model_providers.opencode-go]
+name = "OpenCode Go"
+base_url = "{base_url}/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+"""
+    (codex_home / "config.toml").write_text(profile)
+    env["CODEX_HOME"] = str(codex_home)
 
     codex_path = subprocess.run(["which", "codex"], capture_output=True, text=True)
     if codex_path.returncode != 0:
@@ -605,6 +853,10 @@ def main():
         args = sys.argv[3:]
         i = 0
         while i < len(args):
+            if args[i] == "--":
+                i += 1
+                extra_args.extend(args[i:])
+                break
             if args[i] == "--model" and i + 1 < len(args):
                 model = args[i + 1]
                 i += 2

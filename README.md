@@ -60,6 +60,44 @@ python ocgo.py mapping claude claude-sonnet kimi-k2.6
 python ocgo.py mapping codex gpt-4 gpt-5.3-codex
 ```
 
+## Verified Model Matrix
+
+Measured 2026-10-15 on a Go subscription. Output tokens are what a coding
+agent actually burns, which is what a metered plan charges against.
+
+### Claude Code (Anthropic Messages API)
+
+| Model | Speed | Output tokens | Tool calls | Notes |
+|---|---|---|---|---|
+| `longcat-2.0` | 2.2s | 82 | yes | **Best value.** Correct code, fast, cheap |
+| `longcat-2.5-preview-free` | 4.5s | 144 | yes | Free tier, correct code |
+| `mimo-v2.6-flash` | 2.6s | 35 | yes | Cheapest. Good code, weak math |
+| `kimi-k2.7-code` | 1.3s | 248 | yes | Code-focused |
+| `minimax-m2.5` | 1.5s | 81 | yes | Cheap |
+| `glm-5.3-flash` | 0.6s | 185 | yes | Fastest; sometimes calls a tool when asked for plain text |
+| `kimi-k2.6` | 27s | 987 | yes | Avoid. 20-40x the tokens of the flash models |
+| `kimi-k3` | slow | 1600+ | yes | Avoid for cost |
+
+### Codex (OpenAI Responses API)
+
+| Model | Status |
+|---|---|
+| `grok-4.7` | Works |
+| `kimi-*`, `gpt-5-3-codex` | Rejected: these models do not serve the Responses protocol |
+| `longcat-*`, `glm-*`, `mimo-*` | Untested with Codex |
+
+`deepseek-*` models are blocked unless the workspace Privacy setting is
+"Global". Raise that to unlock them.
+
+### The cost trap
+
+Reasoning models spend tokens on hidden `reasoning` before answering. On a
+trivial "say hi in 3 words" prompt, `kimi-k2.6` consumed 330 output tokens and
+`kimi-k3` consumed 1600+, while `mimo-v2.6-flash` used 35. The bridge forwards
+`max_tokens` as sent, so a low budget makes reasoning models return empty
+content with `finish_reason: length` rather than an answer. Set `max_tokens`
+above 2000 when driving reasoning models, or use a flash model.
+
 ## Requirements
 
 - Python 3.10+
