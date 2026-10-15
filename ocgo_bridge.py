@@ -11,6 +11,8 @@ import os
 import sys
 import subprocess
 import signal
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +36,15 @@ SESSION_ID = str(uuid.uuid4())
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3456
+
+# Claude Code asks for an opus, a sonnet and a haiku model by default, none of
+# which exist on Go. Every slot has to point at a model that does, or the run
+# fails on the model check before a request is sent.
+#
+# The two tools cannot share one default: Codex speaks only the Responses API,
+# and only a subset of Go models serve it, so they get separate defaults.
+DEFAULT_MODEL = "longcat-2.0"
+DEFAULT_CODEX_MODEL = "grok-4.7"
 
 # <model-id>: (label, verified path)
 KNOWN_MODELS = {
@@ -106,20 +117,34 @@ def setup():
     existing = load_config() or {}
     default_port = existing.get("port", DEFAULT_PORT)
     default_host = existing.get("host", DEFAULT_HOST)
+    default_model = existing.get("model", DEFAULT_MODEL)
 
     api_key = input("OpenCode Go API key: ").strip()
     host = input(f"Proxy host [{default_host}]: ").strip() or default_host
     port_str = input(f"Proxy port [{default_port}]: ").strip()
     port = int(port_str) if port_str else default_port
+    model = input(f"Default Claude model [{default_model}]: ").strip() or default_model
+    default_codex_model = existing.get("codex_model", DEFAULT_CODEX_MODEL)
+    codex_model = input(
+        f"Default Codex model [{default_codex_model}]: "
+    ).strip() or default_codex_model
 
     if not api_key:
         print("Error: API key cannot be empty")
         sys.exit(1)
 
-    config = {"api_key": api_key, "host": host, "port": port}
+    config = {
+        "api_key": api_key,
+        "host": host,
+        "port": port,
+        "model": model,
+        "codex_model": codex_model,
+    }
     save_config(config)
     print(f"\nConfig saved to {CONFIG_FILE}")
     print(f"Proxy will run on http://{host}:{port}")
+    print(f"Claude model: {model}")
+    print(f"Codex model:  {codex_model}")
 
 
 def serve(background=False):
@@ -724,10 +749,23 @@ def launch_claude(model=None, extra_args=None):
     env = os.environ.copy()
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = "unused"
+    env["ANTHROPIC_API_KEY"] = "unused"
 
-    if model:
-        env["ANTHROPIC_MODEL"] = model
-        env["ANTHROPIC_SMALL_FAST_MODEL"] = model
+    chosen = model or config.get("model") or DEFAULT_MODEL
+
+    # Claude Code reads a different slot depending on the job: ANTHROPIC_MODEL
+    # for the main turn, the DEFAULT_* trio for its opus/sonnet/haiku picker,
+    # and SMALL_FAST_MODEL for background work like titles. Leaving any of them
+    # unset makes it ask for a real Claude model and die on the model check.
+    slots = [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ]
+    for slot in slots:
+        env[slot] = chosen
 
     claude_path = subprocess.run(["which", "claude"], capture_output=True, text=True)
     if claude_path.returncode != 0:
@@ -741,8 +779,7 @@ def launch_claude(model=None, extra_args=None):
 
     print(f"Launching Claude Code via OpenCode Go bridge...")
     print(f"Proxy: {base_url}")
-    if model:
-        print(f"Model: {model}")
+    print(f"Model: {chosen}")
 
     try:
         subprocess.run(args, env=env)
@@ -770,48 +807,47 @@ def launch_codex(model=None, extra_args=None):
         time.sleep(1)
 
     env = os.environ.copy()
+    # Codex only honors an API key, never OPENAI_BASE_URL, for the built-in
+    # provider, so the endpoint has to arrive as provider config. Passing it as
+    # -c flags keeps it scoped to this launch, the way the standardcompute
+    # launcher does, and leaves ~/.codex untouched. An empty CODEX_HOME is what
+    # stops a stored ChatGPT login from overriding the key and tripping Codex's
+    # own client-side model validation.
     env["OPENAI_API_KEY"] = "ocgo-bridge"
-    env["OPENAI_BASE_URL"] = f"{base_url}/v1"
-
-    # Codex validates model names client-side when it finds stored ChatGPT
-    # OAuth tokens. A private CODEX_HOME forces API-key auth mode and keeps
-    # the user's real ~/.codex untouched.
-    codex_home = CONFIG_DIR / "codex-home"
-    codex_home.mkdir(parents=True, exist_ok=True)
-    profile = 'model_provider = "opencode-go"\n'
-    if model:
-        profile += f'model = "{model}"\n'
-    profile += f"""
-[model_providers.opencode-go]
-name = "OpenCode Go"
-base_url = "{base_url}/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-"""
-    (codex_home / "config.toml").write_text(profile)
+    chosen = model or config.get("codex_model") or DEFAULT_CODEX_MODEL
+    codex_home = Path(tempfile.mkdtemp(prefix="opencode-go-codex-"))
     env["CODEX_HOME"] = str(codex_home)
+
+    provider = [
+        "-c", f'model="{chosen}"',
+        "-c", 'model_provider="opencode-go"',
+        "-c", 'model_providers.opencode-go.name="OpenCode Go"',
+        "-c", f'model_providers.opencode-go.base_url="{base_url}/v1"',
+        "-c", 'model_providers.opencode-go.env_key="OPENAI_API_KEY"',
+        "-c", 'model_providers.opencode-go.wire_api="responses"',
+    ]
 
     codex_path = subprocess.run(["which", "codex"], capture_output=True, text=True)
     if codex_path.returncode != 0:
         print("Error: 'codex' CLI not found in PATH")
         print("Install it with: npm install -g @openai/codex")
+        shutil.rmtree(codex_home, ignore_errors=True)
         sys.exit(1)
 
-    args = ["codex"]
-    if model:
-        args.extend(["--model", model])
+    args = ["codex"] + provider
     if extra_args:
         args.extend(extra_args)
 
     print(f"Launching Codex CLI via OpenCode Go bridge...")
     print(f"Proxy: {base_url}")
-    if model:
-        print(f"Model: {model}")
+    print(f"Model: {chosen}")
 
     try:
         subprocess.run(args, env=env)
     except KeyboardInterrupt:
         pass
+    finally:
+        shutil.rmtree(codex_home, ignore_errors=True)
 
 
 def main():

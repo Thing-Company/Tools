@@ -16,4 +16,8 @@ alias ocgo-list='ocgo list'
 alias ocgo-claude='ocgo launch claude'
 alias ocgo-codex='ocgo launch codex'
 
-# Quick launch with model: ocgo-claude --model kimi-k2.6
+# Examples:
+#   ocgo-claude                          # default model
+#   ocgo-claude -- -p "review this diff"  # headless prompt
+#   ocgo-claude --model mimo-v2.6-flash  # pick a model
+#   ocgo-codex -- exec "explain this"     # Codex

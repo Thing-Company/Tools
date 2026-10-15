@@ -16,13 +16,14 @@ This tool starts a local compatibility proxy that:
 pip install -r requirements.txt
 
 # 2. Configure your OpenCode Go API key
-python ocgo.py setup
+python ocgo_bridge.py setup
 
-# 3. Launch Claude Code through OpenCode Go
-python ocgo.py launch claude --model kimi-k2.6
+# 3. Launch either tool with no model flag needed
+python ocgo_bridge.py launch claude
+python ocgo_bridge.py launch codex
 
-# Or launch Codex CLI through OpenCode Go
-python ocgo.py launch codex --model kimi-k2.6
+# Or pick a model per run
+python ocgo_bridge.py launch claude --model mimo-v2.6-flash
 ```
 
 ## Commands
@@ -45,9 +46,32 @@ Config is stored in `~/.config/opencode-go-bridge/config.json`:
 {
   "api_key": "your-opencode-go-api-key",
   "host": "127.0.0.1",
-  "port": 3456
+  "port": 3456,
+  "model": "longcat-2.0",
+  "codex_model": "grok-4.7"
 }
 ```
+
+`model` is the default for Claude Code, `codex_model` for Codex. They cannot be
+the same value: Codex speaks only the OpenAI Responses API and most Go models
+do not serve it.
+
+## How Config Is Passed
+
+Nothing is written to `~/.claude` or `~/.codex`, and no login is required for
+either tool.
+
+Claude Code reads a different env var per job, so all of them are set to the
+same model: `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` for background work,
+and the `ANTHROPIC_DEFAULT_OPUS_MODEL` / `_SONNET_` / `_HAIKU_` trio for its
+model picker. Leaving any slot unset makes it ask for a real Claude model and
+fail before a request is sent.
+
+Codex is the opposite. It ignores `OPENAI_BASE_URL` for its built-in provider,
+which is why it needs an explicit provider entry. That entry is passed as `-c`
+flags, scoped to the single launch, and `CODEX_HOME` points at a throwaway
+temp directory so a stored ChatGPT login cannot override the API key and trip
+Codex's own client-side model validation. The temp directory is removed on exit.
 
 ## Model Mappings
 
