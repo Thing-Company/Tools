@@ -7,20 +7,19 @@ Chat Completions API requests into OpenCode Go API calls.
 """
 
 import json
-import os
 import sys
+import os
 import subprocess
 import signal
 import shutil
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-
-import httpx
-import yaml
 
 CONFIG_DIR = Path.home() / ".config" / "opencode-go-bridge"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -37,29 +36,83 @@ SESSION_ID = str(uuid.uuid4())
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3456
 
+# Reasoning models can take several minutes on a large tool list before they
+# emit any output, so the upstream socket has to outlive that.
+UPSTREAM_TIMEOUT = 600
+
 # Claude Code asks for an opus, a sonnet and a haiku model by default, none of
 # which exist on Go. Every slot has to point at a model that does, or the run
 # fails on the model check before a request is sent.
 #
 # The two tools cannot share one default: Codex speaks only the Responses API,
 # and only a subset of Go models serve it, so they get separate defaults.
-DEFAULT_MODEL = "longcat-2.0"
-DEFAULT_CODEX_MODEL = "grok-4.7"
+#
+# Each model carries (protocol, price_tier, monthly_limit_go, monthly_limit_goplus).
+# protocol: "chat"=Chat Completions (my proxy translates to Anthropic)
+#           "anthropic"=Native Anthropic Messages (no translation)
+#           "responses"=OpenAI Responses (Codex only)
+# price_tier: "free", "cheap", "standard", "premium" — rough bucket
+# monthly_limit_go / _goplus: dollars of included usage on each plan
+MODEL_CATALOG = {
+    # Chat Completions (my proxy translates Anthropic -> Chat)
+    "longcat-2.0":            {"protocol": "chat", "tier": "cheap",     "limit_go": 60,  "limit_goplus": 240},
+    "longcat-2.5-preview-free": {"protocol": "chat", "tier": "free",      "limit_go": 999, "limit_goplus": 999},
+    "mimo-v2.6-flash":         {"protocol": "chat", "tier": "cheap",     "limit_go": 60,  "limit_goplus": 120},
+    "mimo-v2.5":               {"protocol": "chat", "tier": "cheap",     "limit_go": 60,  "limit_goplus": 120},
+    "glm-5.3-flash":           {"protocol": "chat", "tier": "cheap",     "limit_go": 60,  "limit_goplus": 180},
+    "glm-5.2":                 {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 180},
+    "glm-5.3":                 {"protocol": "chat", "tier": "premium",   "limit_go": 15,  "limit_goplus": 120},
+    "kimi-k2.7-code":          {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 180},
+    "kimi-k2.6":               {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 240},
+    "kimi-k3":                 {"protocol": "chat", "tier": "premium",   "limit_go": 15,  "limit_goplus": 60},
+    "deepseek-v4.1-flash":     {"protocol": "chat", "tier": "cheap",     "limit_go": 80,  "limit_goplus": 160},
+    "deepseek-v4-pro":         {"protocol": "chat", "tier": "premium",   "limit_go": 15,  "limit_goplus": 60},
+    "step-5-preview":          {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 240},
+    "qwen3.7-plus":            {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 180},
+    "qwen3.8-flash":           {"protocol": "chat", "tier": "standard",  "limit_go": 30,  "limit_goplus": 90},
+    "qwen3.8-max":             {"protocol": "chat", "tier": "premium",   "limit_go": 15,  "limit_goplus": 60},
+    "qwen3.8-max":             {"protocol": "chat", "tier": "premium",   "limit_go": 15,  "limit_goplus": 60},
+    "minimax-m3":              {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 180},
+    "minimax-m2.7":            {"protocol": "chat", "tier": "standard",  "limit_go": 60, "limit_goplus": 240},
+    "mimo-v2.6-pro":           {"protocol": "chat", "tier": "standard",  "limit_go": 15,  "limit_goplus": 60},
+    "mimo-v2.5-pro":           {"protocol": "chat", "tier": "standard",  "limit_go": 15,  "limit_goplus": 60},
+    "hy3":                     {"protocol": "chat", "tier": "cheap",     "limit_go": 60,  "limit_goplus": 240},
+    "hy4-preview":             {"protocol": "chat", "tier": "standard",  "limit_go": 30,  "limit_goplus": 120},
+    "space-bunny":             {"protocol": "chat", "tier": "standard",  "limit_go": 30,  "limit_goplus": 120},
+    "longcat-2.5-preview-free": {"protocol": "chat", "tier": "free",     "limit_go": 999, "limit_goplus": 999},
+    "cat-jam-free":            {"protocol": "chat", "tier": "free",      "limit_go": 999, "limit_goplus": 999},
+    "step-5-preview":          {"protocol": "chat", "tier": "standard",  "limit_go": 60,  "limit_goplus": 240},
 
-# <model-id>: (label, verified path)
-KNOWN_MODELS = {
-    "longcat-2.0": "longcat-2.0",
-    "longcat-2.5-preview-free": "longcat-2.5-preview-free (free tier)",
-    "mimo-v2.6-flash": "mimo-v2.6-flash (cheapest)",
-    "glm-5.3-flash": "glm-5.3-flash (fastest)",
-    "kimi-k2.7-code": "kimi-k2.7-code",
-    "minimax-m2.5": "minimax-m2.5",
-    "kimi-k2.6": "kimi-k2.6 (expensive reasoning)",
-    "kimi-k3": "kimi-k3 (expensive reasoning)",
-    "grok-4.7": "grok-4.7 (Responses API / Codex)",
-    "deepseek-v4-pro": "deepseek-v4-pro (needs Global region)",
-    "deepseek-v4.1-flash": "deepseek-v4.1-flash (needs Global region)",
+    # Native Anthropic Messages (no translation, but low limits on Go)
+    "claude-haiku-5-5":        {"protocol": "anthropic", "tier": "cheap", "limit_go": 15, "limit_goplus": 60},
+    "minimax-m3":              {"protocol": "anthropic", "tier": "standard", "limit_go": 60, "limit_goplus": 180},
+    "minimax-m2.7":            {"protocol": "anthropic", "tier": "standard", "limit_go": 60, "limit_goplus": 240},
+    "qwen3.8-max":             {"protocol": "anthropic", "tier": "premium", "limit_go": 15, "limit_goplus": 60},
+    "qwen3.8-flash":           {"protocol": "anthropic", "tier": "standard", "limit_go": 30, "limit_goplus": 90},
+    "qwen3.7-plus":            {"protocol": "anthropic", "tier": "standard", "limit_go": 60, "limit_goplus": 180},
+
+    # OpenAI Responses (Codex only)
+    "grok-4.7":                {"protocol": "responses", "tier": "premium", "limit_go": 15, "limit_goplus": 60},
+    "grok-4.6":                {"protocol": "responses", "tier": "premium", "limit_go": 15, "limit_goplus": 60},
+    "gpt-6-luna":              {"protocol": "responses", "tier": "standard", "limit_go": 15, "limit_goplus": 60},
+    "gpt-5.6-luna":            {"protocol": "responses", "tier": "standard", "limit_go": 15, "limit_goplus": 60},
+    "muse-spark-1.3-contributor": {"protocol": "responses", "tier": "standard", "limit_go": 60, "limit_goplus": 120},
+    "muse-spark-1.2-contributor": {"protocol": "responses", "tier": "standard", "limit_go": 60, "limit_goplus": 120},
+
+    # Free (Chat)
+    "longcat-2.5-preview-free": {"protocol": "chat", "tier": "free", "limit_go": 999, "limit_goplus": 999},
+    "cat-jam-free":             {"protocol": "chat", "tier": "free", "limit_go": 999, "limit_goplus": 999},
 }
+
+# Per-slot defaults for Claude Code. Each slot reads a different env var.
+# All models here are Chat Completions (verified working through proxy).
+# Opus = hard reasoning, Sonnet = main, Haiku = background.
+DEFAULT_SLOTS = {
+    "haiku": "longcat-2.5-preview-free",   # FREE, unlimited
+    "sonnet": "longcat-2.0",               # cheap, $60 limit
+    "opus": "step-5-preview",              # 4x promo, $60 limit
+}
+DEFAULT_CODEX_MODEL = "grok-4.7"
 
 
 def normalize_openai_messages(messages):
@@ -113,21 +166,29 @@ def setup():
     print("OpenCode Go Bridge - Setup")
     print("Get your API key from https://opencode.ai/console/go")
     print()
+    print("Claude Code reads three different model slots. Pick one per slot:")
+    print("  haiku  = background tasks (titles, summaries) — use FREE model")
+    print("  sonnet = everyday coding                       — balanced")
+    print("  opus   = hard reasoning                        — when you need it")
+    print()
 
     existing = load_config() or {}
     default_port = existing.get("port", DEFAULT_PORT)
     default_host = existing.get("host", DEFAULT_HOST)
-    default_model = existing.get("model", DEFAULT_MODEL)
+    haiku_def = existing.get("haiku_model", DEFAULT_SLOTS["haiku"])
+    sonnet_def = existing.get("sonnet_model", DEFAULT_SLOTS["sonnet"])
+    opus_def = existing.get("opus_model", DEFAULT_SLOTS["opus"])
+    codex_def = existing.get("codex_model", DEFAULT_CODEX_MODEL)
 
     api_key = input("OpenCode Go API key: ").strip()
     host = input(f"Proxy host [{default_host}]: ").strip() or default_host
-    port_str = input(f"Proxy port [{default_port}]: ").strip()
-    port = int(port_str) if port_str else default_port
-    model = input(f"Default Claude model [{default_model}]: ").strip() or default_model
-    default_codex_model = existing.get("codex_model", DEFAULT_CODEX_MODEL)
-    codex_model = input(
-        f"Default Codex model [{default_codex_model}]: "
-    ).strip() or default_codex_model
+    port_str = input(f"Proxy port [{DEFAULT_PORT}]: ").strip()
+    port = int(port_str) if port_str else DEFAULT_PORT
+
+    haiku = input(f"Haiku model [{haiku_def}]: ").strip() or haiku_def
+    sonnet = input(f"Sonnet model [{sonnet_def}]: ").strip() or sonnet_def
+    opus = input(f"Opus model [{opus_def}]: ").strip() or opus_def
+    codex = input(f"Codex model [{DEFAULT_CODEX_MODEL}]: ").strip() or DEFAULT_CODEX_MODEL
 
     if not api_key:
         print("Error: API key cannot be empty")
@@ -137,14 +198,16 @@ def setup():
         "api_key": api_key,
         "host": host,
         "port": port,
-        "model": model,
-        "codex_model": codex_model,
+        "haiku_model": haiku,
+        "sonnet_model": sonnet,
+        "opus_model": opus,
+        "codex_model": codex,
     }
     save_config(config)
     print(f"\nConfig saved to {CONFIG_FILE}")
-    print(f"Proxy will run on http://{host}:{port}")
-    print(f"Claude model: {model}")
-    print(f"Codex model:  {codex_model}")
+    print(f"Proxy: http://{host}:{port}")
+    print(f"Claude slots: haiku={haiku} sonnet={sonnet} opus={opus}")
+    print(f"Codex model: {codex}")
 
 
 def serve(background=False):
@@ -217,20 +280,59 @@ def list_models():
     print("Fetch full list from API:")
     config = load_config()
     if config:
-        try:
-            resp = httpx.get(
-                OPENCODE_GO_MODELS_URL,
-                headers={"Authorization": f"Bearer {config['api_key']}"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if "data" in data:
+        status, body = upstream_get(OPENCODE_GO_MODELS_URL, config["api_key"])
+        if status == 200:
+            try:
+                data = json.loads(body)
+                items = data.get("data", data)
+                if isinstance(items, list):
                     print("\nAvailable models from API:")
-                    for m in data["data"]:
+                    for m in items:
                         print(f"  {m.get('id', 'unknown')}")
-        except Exception as e:
-            print(f"  Could not fetch models: {e}")
+            except Exception:
+                print("  Could not parse response")
+        else:
+            print(f"  API returned {status}")
+
+
+def upstream_post(url, api_key, payload, want_stream=False, session_id=None):
+    """POST to OpenCode Go and return a response object.
+
+    Returns (status, body) for a buffered reply or (status, iterator) for a
+    streaming one. Uses only the standard library so the script runs from any
+    Python with no dependencies to install.
+    """
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-opencode-session", session_id or SESSION_ID)
+    req.add_header("User-Agent", "opencode-go-bridge/1.0")
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        return 502, json.dumps({"error": str(e.reason)}).encode()
+
+    if not want_stream:
+        return resp.status, resp.read()
+
+    return resp.status, iter(resp)
+
+
+def upstream_get(url, api_key):
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("x-opencode-session", SESSION_ID)
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        return 502, json.dumps({"error": str(e.reason)}).encode()
 
 
 def run_server(config):
@@ -239,8 +341,6 @@ def run_server(config):
     api_key = config["api_key"]
 
     print(f"Starting proxy on http://{host}:{port}")
-
-    client = httpx.Client(timeout=httpx.Timeout(300.0))
 
     class ProxyHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -302,19 +402,20 @@ def run_server(config):
             path = self.path
 
             route = path.split("?", 1)[0]
+            session_id = self.headers.get("x-opencode-session") or self.headers.get("X-Opencode-Session")
 
             if route == "/v1/messages":
-                handle_anthropic_messages(self, data, client, api_key)
+                handle_anthropic_messages(self, data, api_key, session_id)
             elif route == "/v1/chat/completions":
-                handle_openai_chat(self, data, client, api_key)
+                handle_openai_chat(self, data, api_key, session_id)
             elif route == "/v1/responses":
-                handle_openai_responses(self, data, client, api_key)
+                handle_openai_responses(self, data, api_key, session_id)
             elif route == "/v1/messages/count_tokens":
                 handle_count_tokens(self, data)
             else:
                 self.send_json(404, {"error": "not found"})
 
-    def handle_anthropic_messages(handler, data, client, api_key):
+    def handle_anthropic_messages(handler, data, api_key, session_id):
         model = data.get("model", "")
         messages = data.get("messages", [])
         system = data.get("system", "")
@@ -403,31 +504,26 @@ def run_server(config):
         if openai_tools:
             openai_data["tools"] = openai_tools
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "x-opencode-session": SESSION_ID,
-        }
-
         try:
-            resp = client.post(
-                OPENCODE_GO_OPENAI_CHAT_URL,
-                headers=headers,
-                content=json.dumps(openai_data),
+            status, resp = upstream_post(
+                OPENCODE_GO_OPENAI_CHAT_URL, api_key, openai_data, want_stream=stream, session_id=session_id
             )
 
-            if resp.status_code >= 400:
-                handler.send_raw(resp.status_code, resp.content)
+            if status >= 400:
+                handler.send_raw(status, resp)
                 return
 
             if stream:
                 handle_stream_chat_completion(handler, resp, model)
             else:
                 handle_non_stream_chat_completion(handler, resp, model)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as e:
-            handler.send_response(502)
-            handler.end_headers()
-            handler.wfile.write(json.dumps({"error": str(e)}).encode())
+            try:
+                handler.send_json(502, {"error": str(e)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def handle_stream_chat_completion(handler, resp, model):
         try:
@@ -457,7 +553,7 @@ def run_server(config):
 
         try:
             buffer = b""
-            for chunk in resp.iter_bytes():
+            for chunk in resp:
                 buffer += chunk
                 while b"\n" in buffer:
                     raw, buffer = buffer.split(b"\n", 1)
@@ -634,27 +730,14 @@ def run_server(config):
                 "usage": {"input_tokens": 0, "output_tokens": 0},
             }
 
-        handler.send_response(200)
-        handler.send_header("Content-Type", "application/json")
-        handler.end_headers()
-        handler.wfile.write(json.dumps(anthropic_resp).encode())
+        handler.send_json(200, anthropic_resp)
 
-    def handle_openai_chat(handler, data, client, api_key):
-        model = data.get("model", "")
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "x-opencode-session": SESSION_ID,
-        }
-
+    def handle_openai_chat(handler, data, api_key, session_id):
         try:
-            resp = client.post(
-                OPENCODE_GO_OPENAI_CHAT_URL,
-                headers=headers,
-                content=json.dumps(data),
+            status, body = upstream_post(
+                OPENCODE_GO_OPENAI_CHAT_URL, api_key, data, session_id=session_id
             )
-
-            handler.send_raw(resp.status_code, resp.content)
+            handler.send_raw(status, body)
         except Exception as e:
             handler.send_json(502, {"error": str(e)})
 
@@ -692,22 +775,13 @@ def run_server(config):
 
         return data
 
-    def handle_openai_responses(handler, data, client, api_key):
+    def handle_openai_responses(handler, data, api_key, session_id):
         data = sanitize_responses_body(data)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "x-opencode-session": SESSION_ID,
-        }
-
         try:
-            resp = client.post(
-                OPENCODE_GO_OPENAI_RESPONSES_URL,
-                headers=headers,
-                content=json.dumps(data),
+            status, body = upstream_post(
+                OPENCODE_GO_OPENAI_RESPONSES_URL, api_key, data, session_id=session_id
             )
-
-            handler.send_raw(resp.status_code, resp.content)
+            handler.send_raw(status, body)
         except Exception as e:
             handler.send_json(502, {"error": str(e)})
 
@@ -723,8 +797,6 @@ def run_server(config):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nProxy stopped.")
-    finally:
-        client.close()
 
 
 def launch_claude(model=None, extra_args=None):
@@ -751,21 +823,17 @@ def launch_claude(model=None, extra_args=None):
     env["ANTHROPIC_AUTH_TOKEN"] = "unused"
     env["ANTHROPIC_API_KEY"] = "unused"
 
-    chosen = model or config.get("model") or DEFAULT_MODEL
+    # Per-slot model mapping: each slot reads a different env var.
+    haiku = model or config.get("haiku_model") or DEFAULT_SLOTS["haiku"]
+    sonnet = config.get("sonnet_model") or DEFAULT_SLOTS["sonnet"]
+    opus = config.get("opus_model") or DEFAULT_SLOTS["opus"]
 
-    # Claude Code reads a different slot depending on the job: ANTHROPIC_MODEL
-    # for the main turn, the DEFAULT_* trio for its opus/sonnet/haiku picker,
-    # and SMALL_FAST_MODEL for background work like titles. Leaving any of them
-    # unset makes it ask for a real Claude model and die on the model check.
-    slots = [
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    ]
-    for slot in slots:
-        env[slot] = chosen
+    # Main turn uses sonnet slot by default
+    env["ANTHROPIC_MODEL"] = sonnet
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = haiku
+    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus
+    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku
 
     claude_path = subprocess.run(["which", "claude"], capture_output=True, text=True)
     if claude_path.returncode != 0:
@@ -779,7 +847,7 @@ def launch_claude(model=None, extra_args=None):
 
     print(f"Launching Claude Code via OpenCode Go bridge...")
     print(f"Proxy: {base_url}")
-    print(f"Model: {chosen}")
+    print(f"Claude slots: haiku={haiku} sonnet={sonnet} opus={opus}")
 
     try:
         subprocess.run(args, env=env)
